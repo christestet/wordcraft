@@ -776,6 +776,10 @@ impl WordApp {
             self.dialog = dialogs::Dialog::open(name, self);
             return Ok(json!({"pending": name}));
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        if discards_document(id, &params) && !self.finish_pending_autosave() {
+            return Err("Wait for AutoSave to finish before replacing or closing the document.".into());
+        }
         if (self.session.dirty || self.save_unconfirmed()) && discards_document(id, &params) {
             let name = self.prompt_name();
             self.dialog = Some(dialogs::Dialog::SaveChanges {
@@ -823,6 +827,12 @@ impl WordApp {
     /// Run a command for a script or an agent (control channel, MCP bridge): never asks first.
     /// UI-level commands (`ui.*`) are handled here, the rest by the engine.
     pub fn execute(&mut self, id: &str, params: Value) -> Result<Value, String> {
+        // The older AutoSave must land before an explicit save, rename or document replacement.
+        // Atomic file replacement prevents torn files, but cannot order independent writers.
+        #[cfg(not(target_arch = "wasm32"))]
+        if (matches!(id, "file.save" | "file.saveAs" | "file.rename") || discards_document(id, &params)) && !self.finish_pending_autosave() {
+            return Err("Wait for AutoSave to finish before saving or closing the document.".into());
+        }
         // A pending Change Picture only survives until the next action (#147).
         if !matches!(id, "ui.changePicture" | "picture.change" | "insert.picture") {
             self.change_picture_target = None;
@@ -1177,10 +1187,13 @@ impl WordApp {
             self.status(tl!("Wait for the print job to finish submitting before closing."));
             return false;
         }
+        // Apply a failed write before checking dirty, so closing still asks to save it.
+        #[cfg(not(target_arch = "wasm32"))]
+        if !self.finish_pending_autosave() {
+            return false;
+        }
         // No document open (#1129): nothing to save.
         if self.quit_requested || !self.session.dirty || !self.has_document() {
-            #[cfg(not(target_arch = "wasm32"))]
-            self.finish_pending_autosave();
             return true;
         }
         let _ = self.run("file.close", json!({}));
@@ -1987,11 +2000,21 @@ impl WordApp {
         let prepared = wordcraft_engine::cmd::file::prepare_save(&mut self.session, &path, &json!({}))?;
         self.session.dirty = false;
         #[cfg(not(target_arch = "wasm32"))]
-        if let Some(w) = &mut self.autosave_worker {
-            self.autosave_pending_rev = Some(self.session.rev());
-            w.submit(prepared);
-            return Ok(());
-        }
+        let prepared = if let Some(w) = &mut self.autosave_worker {
+            match w.submit(prepared) {
+                None => {
+                    self.autosave_pending_rev = Some(self.session.rev());
+                    return Ok(());
+                }
+                Some(prepared) => {
+                    self.autosave_worker = None;
+                    self.autosave_pending_rev = None;
+                    prepared
+                }
+            }
+        } else {
+            prepared
+        };
         if let Err(e) = wordcraft_engine::cmd::file::write_prepared(&prepared) {
             self.session.dirty = true;
             return Err(e);
@@ -1999,31 +2022,47 @@ impl WordApp {
         Ok(())
     }
 
-    /// Wait (bounded) for a background AutoSave in flight to land — used when the window
-    /// closes, so closing never cuts a write short (and by hosts that need the file on disk
-    /// right now).
+    /// Wait (bounded) for a background AutoSave to finish. Returns false on timeout: the
+    /// caller must defer saving, replacing or closing while the older write can still land.
+    /// A completed failure restores unsaved state before the caller proceeds.
     #[cfg(not(target_arch = "wasm32"))]
-    pub fn finish_pending_autosave(&mut self) {
-        let Some(w) = &mut self.autosave_worker else { return };
-        if let Some((_, Err(e))) = w.settle(std::time::Duration::from_secs(5))
-            && self.autosave_pending_rev == Some(self.session.rev())
-        {
-            self.autosave_failure(e);
+    pub fn finish_pending_autosave(&mut self) -> bool {
+        self.wait_for_autosave(std::time::Duration::from_secs(5))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn wait_for_autosave(&mut self, timeout: std::time::Duration) -> bool {
+        let Some(w) = &mut self.autosave_worker else { return true };
+        let outcome = w.settle(timeout);
+        let finished = !w.is_busy();
+        if let Some((_, result)) = outcome {
+            let revision = self.autosave_pending_rev.take();
+            if let Err(e) = result
+                && revision == Some(self.session.rev())
+            {
+                self.autosave_failure(e);
+            }
         }
+        if !finished {
+            self.status("Wait for AutoSave to finish before saving or closing the document.");
+        }
+        finished
     }
 
     /// Apply the outcome of a background AutoSave ([`Self::autosave_write`]); a failure puts
     /// the document back to unsaved and turns AutoSave off for the file, like an inline
-    /// failure would — unless the document was explicitly saved (or edited) since the copy was
-    /// captured, in which case the file on disk is already newer than the failed write. Called
-    /// every frame.
+    /// failure would. Later edits already make the document dirty. Called every frame.
     fn settle_autosave(&mut self) {
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(w) = &mut self.autosave_worker
-            && let Some((_, Err(e))) = w.poll()
-            && self.autosave_pending_rev == Some(self.session.rev())
+            && let Some((_, result)) = w.poll()
         {
-            self.autosave_failure(e);
+            let revision = self.autosave_pending_rev.take();
+            if let Err(e) = result
+                && revision == Some(self.session.rev())
+            {
+                self.autosave_failure(e);
+            }
         }
     }
 
@@ -5109,6 +5148,120 @@ mod tests {
         assert!(!a.autosave_worker.as_ref().is_some_and(|w| w.is_busy()), "the worker is re-armed");
         let saved = wordcraft_engine::io::open_path(&path).unwrap();
         assert!(saved.plain_text(wordcraft_doc::StoryRef::Body).contains("Typed "));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn autosave_with_a_dead_worker_writes_inline() {
+        let dir = scratch("autosave-dead-worker");
+        let path = dir.join("notes.docx");
+        let mut a = typed();
+        a.run("file.save", json!({"path": path.to_string_lossy()})).unwrap();
+        a.autosave_worker = Some(autosave_worker::AutoSaveWorker::dead());
+        a.run("text.insert", json!({"text": "Newest "})).unwrap();
+        a.autosave_tick(now_ms() + 10_000.0);
+        assert!(a.autosave_worker.is_none(), "a dead worker is discarded");
+        assert!(a.autosave_pending_rev.is_none());
+        assert!(!a.session.dirty);
+        assert_eq!(wordcraft_engine::io::open_path(&path).unwrap().plain_text(wordcraft_doc::StoryRef::Body), body_text(&a));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn autosave_with_a_dead_worker_restores_dirty_when_inline_write_fails() {
+        let dir = scratch("autosave-dead-worker-fails");
+        let path = dir.join("gone").join("notes.docx");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut a = typed();
+        a.run("file.save", json!({"path": path.to_string_lossy()})).unwrap();
+        a.autosave_worker = Some(autosave_worker::AutoSaveWorker::dead());
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        a.run("text.insert", json!({"text": "Newest "})).unwrap();
+        a.autosave_tick(now_ms() + 10_000.0);
+        assert!(a.autosave_worker.is_none());
+        assert!(a.session.dirty);
+        assert!(!a.autosaves());
+        assert!(a.status_msg.as_ref().is_some_and(|(msg, _)| msg.contains("AutoSave failed")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn explicit_save_finishes_older_autosave_before_writing_newer_edits() {
+        for id in ["file.save", "file.saveAs"] {
+            let dir = scratch(&format!("autosave-before-{id}"));
+            let path = dir.join("notes.docx");
+            let mut a = typed();
+            a.run("file.save", json!({"path": path.to_string_lossy()})).unwrap();
+            a.run("text.insert", json!({"text": "Older "})).unwrap();
+            a.autosave_tick(now_ms() + 10_000.0);
+            assert!(a.autosave_worker.as_ref().unwrap().is_busy());
+            a.run("text.insert", json!({"text": "Newest "})).unwrap();
+            a.execute(id, json!({"path": path.to_string_lossy()})).unwrap();
+            assert!(!a.autosave_worker.as_ref().unwrap().is_busy(), "{id} must drain the older write");
+            assert!(a.autosave_pending_rev.is_none());
+            assert!(!a.session.dirty);
+            assert!(a.finish_pending_autosave());
+            assert_eq!(wordcraft_engine::io::open_path(&path).unwrap().plain_text(wordcraft_doc::StoryRef::Body), body_text(&a));
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn closing_after_failed_autosave_asks_to_save_unsaved_changes() {
+        let dir = scratch("autosave-close-failure");
+        let path = dir.join("notes.docx");
+        let mut a = typed();
+        a.run("file.save", json!({"path": path.to_string_lossy()})).unwrap();
+        a.autosave_worker = Some(autosave_worker::AutoSaveWorker::controlled(|_| Err("write failed".into())));
+        a.run("text.insert", json!({"text": "Newest "})).unwrap();
+        a.autosave_tick(now_ms() + 10_000.0);
+        assert!(!a.session.dirty, "the pending snapshot provisionally counts as saved");
+        assert!(!a.close_requested(), "a failed write must not allow the window to close");
+        assert!(a.session.dirty);
+        assert!(matches!(a.dialog, Some(dialogs::Dialog::SaveChanges { .. })));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn close_command_settles_pending_autosave_before_deciding_to_prompt() {
+        let dir = scratch("autosave-close-command");
+        let path = dir.join("notes.docx");
+        let mut a = typed();
+        a.run("file.save", json!({"path": path.to_string_lossy()})).unwrap();
+        a.autosave_worker = Some(autosave_worker::AutoSaveWorker::controlled(|_| Err("write failed".into())));
+        a.run("text.insert", json!({"text": "Newest "})).unwrap();
+        a.autosave_tick(now_ms() + 10_000.0);
+        a.run("file.close", json!({})).unwrap();
+        assert!(a.has_document());
+        assert!(a.session.dirty);
+        assert!(matches!(a.dialog, Some(dialogs::Dialog::SaveChanges { .. })));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn autosave_timeout_keeps_the_worker_busy_until_the_write_finishes() {
+        let dir = scratch("autosave-timeout");
+        let path = dir.join("notes.docx");
+        let mut a = typed();
+        a.run("file.save", json!({"path": path.to_string_lossy()})).unwrap();
+        let (release, wait) = std::sync::mpsc::channel();
+        a.autosave_worker = Some(autosave_worker::AutoSaveWorker::controlled(move |save| {
+            wait.recv_timeout(std::time::Duration::from_secs(10)).map_err(|e| e.to_string())?;
+            wordcraft_engine::cmd::file::write_prepared(save)
+        }));
+        a.run("text.insert", json!({"text": "Older "})).unwrap();
+        a.autosave_tick(now_ms() + 10_000.0);
+        let revision = a.autosave_pending_rev;
+        assert!(!a.wait_for_autosave(std::time::Duration::from_millis(1)));
+        assert!(a.autosave_worker.as_ref().unwrap().is_busy());
+        a.run("text.insert", json!({"text": "Newest "})).unwrap();
+        a.autosave_tick(now_ms() + 20_000.0);
+        assert_eq!(a.autosave_pending_rev, revision, "a timeout must not admit another AutoSave");
+        assert!(a.session.dirty);
+        release.send(()).unwrap();
+        a.execute("file.save", json!({})).unwrap();
+        assert!(!a.autosave_worker.as_ref().unwrap().is_busy());
+        assert_eq!(wordcraft_engine::io::open_path(&path).unwrap().plain_text(wordcraft_doc::StoryRef::Body), body_text(&a));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
